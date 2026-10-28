@@ -1,12 +1,13 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { ReviewReport, ReviewReportSchema } from './types/report-types.js';
-import { CodeQualityResult, TestCoverageResult, RefactoringSuggestion } from './types/analysis-results.js';
+import { CodeQualityResult, TestCoverageResult, RefactoringSuggestion, FileAnalysisResult } from './types/analysis-results.js';
 import { analyzeCodeQuality, analyzeTestCoverage, suggestRefactorings } from './agents/index.js';
 import { buildOrchestratorPrompt } from './prompts/index.js';
 import { mcpServersConfig } from './config/mcp.config.js';
 import { logger, logReviewStart, logReviewComplete, logReviewError, logAgentStart, logAgentComplete } from './utils/logger.js';
 import { RateLimiter, RateLimiterConfig } from './utils/rate-limiter.js';
 import { withRetry, withTimeout } from './utils/error-handler.js';
+import { SynthesisEngine } from './utils/synthesis-engine.js';
 
 const model = process.env.ANTHROPIC_MODEL;
 
@@ -20,6 +21,7 @@ if (!model) {
 export interface OrchestratorOptions {
   rateLimiter?: RateLimiter;
   agentTimeout?: number; // Timeout for each subagent in milliseconds
+  synthesisEngine?: SynthesisEngine;
 }
 
 interface FileReview {
@@ -36,10 +38,12 @@ interface FileReview {
 export class CodeReviewOrchestrator {
   private rateLimiter: RateLimiter;
   private agentTimeout: number;
+  private synthesisEngine: SynthesisEngine;
 
   constructor(options: OrchestratorOptions = {}) {
     this.rateLimiter = options.rateLimiter || new RateLimiter();
     this.agentTimeout = options.agentTimeout || 120000; // 2 minutes default
+    this.synthesisEngine = options.synthesisEngine || new SynthesisEngine();
   }
 
   /**
@@ -70,27 +74,40 @@ export class CodeReviewOrchestrator {
       // Step 2: Analyze each file with all three subagents in parallel
       const fileReviews = await this.analyzeFiles(files, fileContents);
 
-      // Step 3: Generate summary and recommendations
-      const summary = this.generateSummary(fileReviews);
-      const recommendations = this.generateRecommendations(fileReviews);
+      // Convert FileReviews to FileAnalysisResults for synthesis
+      const fileAnalyses: FileAnalysisResult[] = fileReviews.map(review => ({
+        file: review.file,
+        codeQuality: review.codeQuality,
+        testCoverage: review.testCoverage,
+        refactoring: review.refactorings,
+        analysisTime: 0 // Would be tracked in actual implementation
+      }));
+
+      // Step 3: Synthesize findings and generate enhanced report
+      const synthesis = this.synthesisEngine.synthesize(fileAnalyses);
+
+      // Step 4: Generate legacy summary for backward compatibility
+      const legacySummary = this.generateSummary(fileReviews);
 
       const duration = Date.now() - startTime;
-      logReviewComplete(owner, repo, prNumber, summary.overallScore, duration);
+      logReviewComplete(owner, repo, prNumber, synthesis.executiveSummary.overallQualityScore, duration);
 
       const report: ReviewReport = {
-        pullRequest: { owner, repo, number: prNumber },
-        fileReviews,
-        summary,
-        recommendations,
         metadata: {
+          prNumber,
+          prTitle: `PR #${prNumber}`,
+          author: 'unknown',
+          repository: `${owner}/${repo}`,
           analyzedAt: new Date().toISOString(),
-          duration,
-          agentVersions: {
-            'code-quality': '1.0.0',
-            'test-coverage': '1.0.0',
-            'refactoring': '1.0.0'
-          }
-        }
+          analysisDuration: duration,
+          analysisVersion: '1.0.0'
+        },
+        executiveSummary: synthesis.executiveSummary,
+        fileAnalyses,
+        synthesizedFindings: synthesis.synthesizedFindings,
+        recommendations: synthesis.recommendations,
+        pullRequest: { owner, repo, number: prNumber },
+        summary: legacySummary
       };
 
       // Validate the report matches our schema
@@ -315,7 +332,8 @@ export class CodeReviewOrchestrator {
   }
 
   /**
-   * Generate top recommendations from file reviews
+   * Generate top recommendations from file reviews (legacy method - now handled by synthesis engine)
+   * @deprecated Use SynthesisEngine instead
    */
   private generateRecommendations(fileReviews: FileReview[]) {
     const recommendations: Array<{
